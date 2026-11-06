@@ -5,7 +5,8 @@
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QComboBox, QTabWidget,
-                               QScrollArea, QFrame, QSplitter, QGroupBox, QCheckBox, QLineEdit)
+                               QScrollArea, QFrame, QSplitter, QGroupBox, QCheckBox, QLineEdit,
+                               QTreeWidget, QTreeWidgetItem)
 from PySide6.QtCore import Qt, Signal, QThread, QMimeData, QPoint
 from PySide6.QtGui import QFont, QIntValidator, QDrag, QPixmap
 import keyboard
@@ -14,6 +15,7 @@ from qfluentwidgets import (CardWidget, PrimaryPushButton, PushButton,
                            isDarkTheme)
 
 from core.preset_manager import PresetManager, PRESET_TYPE_NORMAL_WHITELIST, PRESET_TYPE_DEEPNIGHT_WHITELIST
+from core.relic_scoring import normalize_scoring
 from ui.components.logger_widget import LoggerWidget
 from core.utils import get_user_data_path
 import json
@@ -99,6 +101,7 @@ class CleaningThread(QThread):
     log_signal = Signal(str, str)  # (message, level)
     finished_signal = Signal()
     qualified_relic_signal = Signal(dict)  # 合格遗物信息
+    result_signal = Signal(dict)
 
     def __init__(self, cleaner, mode, cleaning_mode, max_relics, allow_favorited, require_double):
         super().__init__()
@@ -118,7 +121,8 @@ class CleaningThread(QThread):
                 self.max_relics,
                 self.allow_favorited,
                 self.require_double,
-                log_callback=self.log_signal.emit
+                log_callback=self.log_signal.emit,
+                result_callback=self.result_signal.emit
             )
 
             # 清理完成后，发送所有合格遗物信息
@@ -138,16 +142,19 @@ class PresetCard(CardWidget):
     toggle_clicked = Signal(str)  # preset_id
 
     def __init__(self, preset_data: dict, is_general: bool = False, parent=None,
-                 inherited_affixes=None):
+                 inherited_affixes=None, score_enabled=False):
         super().__init__(parent)
         self.preset_data = preset_data
         self.is_general = is_general
         self.inherited_affixes = set(inherited_affixes or [])
+        self.score_enabled = score_enabled
         self.is_expanded = False
 
         self._init_ui()
 
     def _required_groups(self):
+        if self.score_enabled:
+            return []
         from core.relic_matcher import _required_groups
         groups, _, valid = _required_groups(self.preset_data)
         if not valid:
@@ -157,6 +164,13 @@ class PresetCard(CardWidget):
              for member in group]
             for group in groups
         ]
+
+    def _graded_affix(self, affix):
+        if self.preset_data.get("type") == "deepnight_blacklist":
+            return affix
+        tier = self.preset_data.get("affix_tiers", {}).get(affix, "secondary")
+        label = {"core": "重要", "secondary": "次要", "bonus": "锦上添花"}.get(tier, "次要")
+        return f"【{label}】{affix}"
 
     @staticmethod
     def _group_summary(groups):
@@ -202,7 +216,10 @@ class PresetCard(CardWidget):
         info_layout.addWidget(name_label)
 
         # 词条数量
-        self._count_label = QLabel(f"{len(self.preset_data['affixes'])} 条词条")
+        count_text = f"{len(self.preset_data['affixes'])} 条正面词条"
+        if self.score_enabled and self.preset_data.get("negative_tiers"):
+            count_text += f" · {len(self.preset_data['negative_tiers'])} 条负面调整"
+        self._count_label = QLabel(count_text)
         self._count_label.setStyleSheet("color: #888; font-size: 10pt;")
         self._theme_labels.append(self._count_label)
         info_layout.addWidget(self._count_label)
@@ -262,7 +279,7 @@ class PresetCard(CardWidget):
                 " ★" + "、".join(f"组{index}" for index in group_by_affix[affix])
                 if affix in group_by_affix else ""
             )
-            affix_label = QLabel(f"• {affix}{marker}")
+            affix_label = QLabel(f"• {self._graded_affix(affix)}{marker}")
             affix_label.setFont(QFont("Segoe UI", 9))
             affix_label.setStyleSheet("color: #555;")
             affix_label.setWordWrap(True)
@@ -282,9 +299,26 @@ class PresetCard(CardWidget):
                 marker = " ★" + "、".join(
                     f"组{index}" for index in group_by_affix[affix]
                 )
-                label = QLabel(f"• {affix}{marker}")
+                label = QLabel(f"• {self._graded_affix(affix)}{marker}")
                 label.setFont(QFont("Segoe UI", 9))
                 label.setStyleSheet("color: #555;")
+                label.setWordWrap(True)
+                self._affix_labels.append(label)
+                self._theme_labels.append(label)
+                affixes_layout.addWidget(label)
+
+        if self.score_enabled:
+            tier_names = {"core": "重要", "secondary": "次要", "bonus": "锦上添花",
+                          "unacceptable": "不可接受", "harmful": "很伤",
+                          "negligible": "几乎无负面"}
+            for affix, tier in self.preset_data.get("negative_tiers", {}).items():
+                label = QLabel(f"• 【{tier_names.get(tier, tier)}】{affix}")
+                label.setWordWrap(True)
+                self._affix_labels.append(label)
+                self._theme_labels.append(label)
+                affixes_layout.addWidget(label)
+            for affix in self.preset_data.get("excluded_affixes", []):
+                label = QLabel(f"• 【排除通用】{affix}")
                 label.setWordWrap(True)
                 self._affix_labels.append(label)
                 self._theme_labels.append(label)
@@ -341,6 +375,9 @@ class RepoPage(QWidget):
 
     # 预设修改信号
     presets_modified = Signal()
+    scan_requested = Signal()
+    clean_requested = Signal()
+    stop_requested = Signal()
 
     def __init__(self, log_manager=None, preset_manager=None):
         super().__init__()
@@ -372,6 +409,9 @@ class RepoPage(QWidget):
         self.is_manual_stop = False
 
         self._init_ui()
+        self.scan_requested.connect(self._start_scanning, Qt.QueuedConnection)
+        self.clean_requested.connect(self._start_cleaning, Qt.QueuedConnection)
+        self.stop_requested.connect(self._stop_cleaning, Qt.QueuedConnection)
 
     def _init_ui(self):
         """初始化UI"""
@@ -474,6 +514,13 @@ class RepoPage(QWidget):
         self.start_btn.clicked.connect(self._start_cleaning)
         layout.addWidget(self.start_btn)
 
+        self.scan_btn = PushButton("仓库检索(F9)")
+        self.scan_btn.setFixedHeight(36)
+        self.scan_btn.setFixedWidth(125)
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.clicked.connect(self._start_scanning)
+        layout.addWidget(self.scan_btn)
+
         self.stop_btn = PushButton("停止 (F11)")
         self.stop_btn.setFixedHeight(36)
         self.stop_btn.setFixedWidth(80)
@@ -494,7 +541,13 @@ class RepoPage(QWidget):
         # 标题（紧凑版）
         title = QLabel("预设管理")
         title.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 4px 0;")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch()
+        restore = PushButton('恢复默认预设')
+        restore.clicked.connect(self._restore_default_presets)
+        header.addWidget(restore)
+        layout.addLayout(header)
 
         # 滚动区域
         scroll = QScrollArea()
@@ -512,6 +565,21 @@ class RepoPage(QWidget):
         self._refresh_presets()
 
         return panel
+
+    def _restore_default_presets(self):
+        prompt = MessageBox('确认恢复默认预设',
+                            '这会将普通、深夜的通用和专用预设全部恢复为程序内置版本。'
+                            '当前预设会先自动备份。确定继续吗？', self)
+        if prompt.exec() != MessageBox.Accepted:
+            return
+        try:
+            backup = self.preset_manager.restore_bundled_defaults()
+        except Exception as exc:
+            MessageBox('恢复失败', str(exc), self).exec()
+            return
+        self._refresh_presets()
+        self.presets_modified.emit()
+        InfoBar.success('已恢复默认预设', f'原预设备份：{backup}', parent=self)
 
     def _create_right_panel(self) -> QWidget:
         """创建右侧面板"""
@@ -567,6 +635,19 @@ class RepoPage(QWidget):
         stats_layout.addWidget(skipped_card)
 
         layout.addLayout(stats_layout)
+
+        results_group = QGroupBox('最近筛选结果')
+        results_layout = QVBoxLayout(results_group)
+        self.result_filter = QComboBox()
+        self.result_filter.addItems(['全部', '保留', '备选', '淘汰', '无法确认'])
+        self.result_filter.currentTextChanged.connect(self._filter_results)
+        results_layout.addWidget(self.result_filter)
+        self.results_tree = QTreeWidget()
+        self.result_items = {}
+        self.results_tree.setHeaderLabels(['遗物', '颜色', '分数', '判定', '操作', '最佳预设'])
+        self.results_tree.setMinimumHeight(230)
+        results_layout.addWidget(self.results_tree)
+        layout.addWidget(results_group)
 
         # 合格遗物列表（动态标题）
         cleaning_mode = "sell" if self.clean_mode_combo.currentIndex() == 0 else "favorite"
@@ -631,11 +712,12 @@ class RepoPage(QWidget):
                 item.widget().deleteLater()
 
         mode = "normal" if self.mode_combo.currentIndex() == 0 else "deepnight"
+        score_enabled = normalize_scoring(self._load_settings().get("scoring"))["enabled"]
 
         # 通用预设
         general_preset = self.preset_manager.get_general_preset(mode)
         if general_preset:
-            card = PresetCard(general_preset, is_general=True)
+            card = PresetCard(general_preset, is_general=True, score_enabled=score_enabled)
             card.edit_clicked.connect(self._edit_general_preset)
             self.preset_layout.addWidget(card)
 
@@ -649,7 +731,8 @@ class RepoPage(QWidget):
                 card = PresetCard(
                     preset, is_general=False,
                     inherited_affixes=general_preset.get("affixes", [])
-                    if general_preset and general_preset.get("is_active", True) else []
+                    if general_preset and general_preset.get("is_active", True) else [],
+                    score_enabled=score_enabled
                 )
                 card.edit_clicked.connect(self._edit_dedicated_preset)
                 card.delete_clicked.connect(self._delete_preset)
@@ -668,7 +751,7 @@ class RepoPage(QWidget):
         if mode == "deepnight":
             blacklist = self.preset_manager.get_blacklist_preset()
             if blacklist:
-                card = PresetCard(blacklist, is_general=True)
+                card = PresetCard(blacklist, is_general=True, score_enabled=score_enabled)
                 card.edit_clicked.connect(self._edit_blacklist_preset)
                 self.preset_layout.addWidget(card)
 
@@ -726,13 +809,18 @@ class RepoPage(QWidget):
             for_editing=True  # 编辑模式：只加载常规词条
         )
 
-        dialog = PresetEditDialog(vocab, preset, is_general=True, parent=self)
-        dialog.preset_saved.connect(lambda pid, name, affixes: self._save_general_preset(mode, affixes))
+        dialog = PresetEditDialog(vocab, preset, is_general=True, parent=self, mode=mode,
+                                  exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
+                                  if mode == "deepnight" else [],
+                                  default_negative_tiers=normalize_scoring(
+                                      self._load_settings().get("scoring"))["negative_tiers"])
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._save_general_preset(mode, affixes, tiers, negative, official))
         dialog.exec()
 
-    def _save_general_preset(self, mode: str, affixes: list):
+    def _save_general_preset(self, mode: str, affixes: list, tiers=None, negative=None, official=None):
         """保存通用预设"""
-        self.preset_manager.update_general_preset(mode, affixes)
+        self.preset_manager.update_general_preset(mode, affixes, tiers, negative, official)
         self._refresh_presets()
         self.presets_modified.emit()  # 发出预设修改信号
         InfoBar.success("保存成功", "通用预设已更新", parent=self)
@@ -745,8 +833,8 @@ class RepoPage(QWidget):
 
         # 检查数量限制
         dedicated_presets = self.preset_manager.get_dedicated_presets(mode)
-        if len(dedicated_presets) >= 20:
-            MessageBox("错误", "专用预设数量已达上限（20个）", self).exec()
+        if len(dedicated_presets) >= 500:
+            MessageBox("错误", "专用预设数量已达上限（500个）", self).exec()
             return
 
         vocab = self.preset_manager.load_vocabulary(
@@ -759,17 +847,24 @@ class RepoPage(QWidget):
                                   vocab, parent=self, mode=mode,
                                   inherited_vocabulary=general.get("affixes", [])
                                   if general and general.get("is_active", True) else [],
+                                  inherited_tiers=general.get("affix_tiers", {}) if general else {},
+                                  inherited_negative_tiers=general.get("negative_tiers", {}) if general else {},
+                                  default_negative_tiers=normalize_scoring(
+                                      self._load_settings().get("scoring"))["negative_tiers"],
                                   exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
                                   if mode == "deepnight" else [])
-        dialog.grouped_saved.connect(lambda pid, name, affixes, groups, exceptions: self._save_new_preset(mode, name, affixes, groups, exceptions))
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._save_new_preset(mode, name, affixes, tiers, negative, excluded, official))
         dialog.exec()
 
-    def _save_new_preset(self, mode: str, name: str, affixes: list, groups=None, exceptions=None):
+    def _save_new_preset(self, mode: str, name: str, affixes: list, tiers=None, negative=None, excluded=None, official=None):
         """保存新预设"""
         try:
             self.preset_manager.create_dedicated_preset(mode, name, affixes,
-                                                        blacklist_exceptions=exceptions,
-                                                        required_affix_groups=groups)
+                                                        blacklist_exceptions=[], required_affix_groups=[],
+                                                        affix_tiers=tiers, negative_tiers=negative,
+                                                        excluded_affixes=excluded,
+                                                        official_scores=official if mode == 'normal' else None)
             self._refresh_presets()
             self.presets_modified.emit()  # 发出预设修改信号
             InfoBar.success("创建成功", f"预设 '{name}' 已创建", parent=self)
@@ -797,18 +892,24 @@ class RepoPage(QWidget):
                                   vocab, preset, parent=self, mode=mode,
                                   inherited_vocabulary=general.get("affixes", [])
                                   if general and general.get("is_active", True) else [],
+                                  inherited_tiers=general.get("affix_tiers", {}) if general else {},
+                                  inherited_negative_tiers=general.get("negative_tiers", {}) if general else {},
+                                  default_negative_tiers=normalize_scoring(
+                                      self._load_settings().get("scoring"))["negative_tiers"],
                                   exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
                                   if mode == "deepnight" else [])
-        dialog.grouped_saved.connect(lambda pid, name, affixes, groups, exceptions: self._update_preset(mode, preset_id, name, affixes, groups, exceptions))
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._update_preset(mode, preset_id, name, affixes, tiers, negative, excluded, official))
         dialog.exec()
 
-    def _update_preset(self, mode: str, preset_id: str, name: str, affixes: list, groups=None, exceptions=None):
+    def _update_preset(self, mode: str, preset_id: str, name: str, affixes: list, tiers=None, negative=None, excluded=None, official=None):
         """更新预设"""
         try:
             self.preset_manager.update_dedicated_preset(
                 mode, preset_id, name, affixes,
-                blacklist_exceptions=exceptions,
-                required_affix_groups=groups)
+                blacklist_exceptions=[], required_affix_groups=[], affix_tiers=tiers,
+                negative_tiers=negative, excluded_affixes=excluded,
+                official_scores=official if mode == 'normal' else None)
         except ValueError as e:
             MessageBox("错误", f"保存预设失败: {e}", self).exec()
             return
@@ -861,10 +962,15 @@ class RepoPage(QWidget):
             # 取消勾选，显示输入框
             self.max_input.setVisible(True)
 
-    def _start_cleaning(self):
+    def _start_scanning(self):
+        self._start_cleaning(scan_only=True)
+
+    def _start_cleaning(self, scan_only=False):
         """开始清理"""
         mode = "normal" if self.mode_combo.currentIndex() == 0 else "deepnight"
-        cleaning_mode = "sell" if self.clean_mode_combo.currentIndex() == 0 else "favorite"
+        cleaning_mode = ("scan" if scan_only else
+                         "sell" if self.clean_mode_combo.currentIndex() == 0 else "favorite")
+        self.active_cleaning_mode = cleaning_mode
 
         # 获取数量
         auto_detect = self.auto_detect_checkbox.isChecked()
@@ -895,16 +1001,19 @@ class RepoPage(QWidget):
         self.logger.clear()
         if self.log_manager:
             self.log_manager.clear_all()  # 清空所有订阅者的日志
-            self.log_manager.log("开始清理...", "INFO")
+            self.log_manager.log("开始仓库检索..." if scan_only else "开始清理...", "INFO")
         else:
-            self.logger.log("开始清理...", "INFO")
+            self.logger.log("开始仓库检索..." if scan_only else "开始清理...", "INFO")
         self._clear_relics_records()
+        self.results_tree.clear()
+        self.result_items.clear()
 
         # 重置手动停止标志
         self.is_manual_stop = False
 
         # 禁用按钮
         self.start_btn.setEnabled(False)
+        self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
         # 创建并启动线程
@@ -914,6 +1023,7 @@ class RepoPage(QWidget):
         self.cleaning_thread.log_signal.connect(self._on_log)
         self.cleaning_thread.finished_signal.connect(self._on_cleaning_finished)
         self.cleaning_thread.qualified_relic_signal.connect(self._add_qualified_relic)
+        self.cleaning_thread.result_signal.connect(self._on_result)
         self.cleaning_thread.start()
 
     def _on_log(self, message: str, level: str):
@@ -922,6 +1032,38 @@ class RepoPage(QWidget):
             self.log_manager.log(message, level)
         else:
             self.logger.log(message, level)
+
+    def _on_result(self, result: dict):
+        old = self.result_items.pop(result['index'], None)
+        if old is not None:
+            position = self.results_tree.indexOfTopLevelItem(old)
+            if position >= 0:
+                self.results_tree.takeTopLevelItem(position)
+        score = (str(result['score']) if result['score'] is not None
+                 else ('未启用评分' if not result['scoring_enabled'] else '无候选分数'))
+        item = QTreeWidgetItem([f"#{result['index']}", result['color'], score,
+                                result['decision'], result['action'], result['preset_name'] or '无'])
+        item.setData(0, Qt.UserRole, result['decision'])
+        for affix in result['affix_scores']:
+            value = affix['points']
+            item.addChild(QTreeWidgetItem([affix['name'], '',
+                f'{value:+d}' if value is not None else '未启用评分', '', '', '']))
+        if result['reason']:
+            item.addChild(QTreeWidgetItem(['原因：' + result['reason']]))
+        self.results_tree.insertTopLevelItem(0, item)
+        self.result_items[result['index']] = item
+        if self.results_tree.topLevelItemCount() > 200:
+            removed = self.results_tree.takeTopLevelItem(200)
+            for key, value in list(self.result_items.items()):
+                if value is removed:
+                    del self.result_items[key]
+        self._filter_results(self.result_filter.currentText())
+        self._update_dashboard(self.repo_cleaner.stats)
+
+    def _filter_results(self, choice):
+        for index in range(self.results_tree.topLevelItemCount()):
+            item = self.results_tree.topLevelItem(index)
+            item.setHidden(choice != '全部' and item.data(0, Qt.UserRole) != choice)
 
     def _stop_cleaning(self):
         """停止清理"""
@@ -936,12 +1078,14 @@ class RepoPage(QWidget):
     def _on_cleaning_finished(self):
         """清理完成"""
         self.start_btn.setEnabled(True)
+        self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         reason = self.repo_cleaner.stop_reason
+        scanning = getattr(self, 'active_cleaning_mode', None) == 'scan'
         messages = {
-            "manual": ("清理已手动停止", "WARNING"),
-            "completed": ("清理已完成", "SUCCESS"),
-            "error": ("清理异常停止，请检查日志", "ERROR"),
+            "manual": ("检索已手动停止" if scanning else "清理已手动停止", "WARNING"),
+            "completed": ("检索已完成" if scanning else "清理已完成", "SUCCESS"),
+            "error": ("检索异常停止，请检查日志" if scanning else "清理异常停止，请检查日志", "ERROR"),
         }
         self._on_log(*messages.get(reason, messages["error"]))
         self.is_manual_stop = False
@@ -951,10 +1095,10 @@ class RepoPage(QWidget):
         self._update_dashboard(stats)
 
         # 保存售出/收藏遗物到持久化存储
-        cleaning_mode = "sell" if self.clean_mode_combo.currentIndex() == 0 else "favorite"
+        cleaning_mode = getattr(self, 'active_cleaning_mode', 'sell')
         if cleaning_mode == "sell":
             self._save_sold_relics()
-        else:
+        elif cleaning_mode == "favorite":
             self._save_favorited_relics()
 
     def _update_dashboard(self, stats: dict):
@@ -1149,6 +1293,7 @@ class RepoPage(QWidget):
 
         # 启用开始按钮
         self.start_btn.setEnabled(True)
+        self.scan_btn.setEnabled(True)
         self.start_btn.setText("开始清理(F10)")
         # 输出成功日志
         if self.log_manager:
@@ -1158,7 +1303,8 @@ class RepoPage(QWidget):
 
     def _setup_shortcuts(self):
         """设置全局快捷键"""
-        # F10 开始清理
+        # F9 只扫描录库；F10 按所选清理模式操作。
+        keyboard.add_hotkey('F9', self._on_scan_shortcut, suppress=False)
         keyboard.add_hotkey('F10', self._on_start_shortcut, suppress=False)
         # F11 停止清理
         keyboard.add_hotkey('F11', self._on_stop_shortcut, suppress=False)
@@ -1166,12 +1312,13 @@ class RepoPage(QWidget):
     def _on_start_shortcut(self):
         """F10 快捷键触发开始"""
         if self.isVisible() and self.start_btn.isEnabled():
-            # 使用 QMetaObject.invokeMethod 确保在主线程执行
-            from PySide6.QtCore import QMetaObject, Qt as QtCore_Qt
-            QMetaObject.invokeMethod(self, "_start_cleaning", QtCore_Qt.QueuedConnection)
+            self.clean_requested.emit()
+
+    def _on_scan_shortcut(self):
+        if self.isVisible() and self.scan_btn.isEnabled():
+            self.scan_requested.emit()
 
     def _on_stop_shortcut(self):
         """F11 快捷键触发停止"""
         if self.isVisible() and self.stop_btn.isEnabled():
-            from PySide6.QtCore import QMetaObject, Qt as QtCore_Qt
-            QMetaObject.invokeMethod(self, "_stop_cleaning", QtCore_Qt.QueuedConnection)
+            self.stop_requested.emit()

@@ -13,6 +13,7 @@ from qfluentwidgets import (CardWidget, PrimaryPushButton, PushButton,
                            ComboBox, MessageBox, InfoBar, InfoBarPosition)
 
 from core.preset_manager import PresetManager, PRESET_TYPE_NORMAL_WHITELIST, PRESET_TYPE_DEEPNIGHT_WHITELIST
+from core.relic_scoring import normalize_scoring
 from ui.components.logger_widget import LoggerWidget
 from core.utils import get_user_data_path
 import json
@@ -139,6 +140,7 @@ class PageShop(QWidget):
         """外部更新设置（由设置页面信号触发）"""
         self.settings = settings
         self._update_stop_condition_ui()
+        self._refresh_presets()
 
     def _update_stop_condition_ui(self):
         """根据SL模式设置切换停止条件UI"""
@@ -300,7 +302,13 @@ class PageShop(QWidget):
         # 标题
         title = QLabel("预设管理")
         title.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 4px 0;")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch()
+        restore = PushButton('恢复默认预设')
+        restore.clicked.connect(self._restore_default_presets)
+        header.addWidget(restore)
+        layout.addLayout(header)
 
         # 滚动区域
         scroll = QScrollArea()
@@ -315,6 +323,21 @@ class PageShop(QWidget):
         layout.addWidget(scroll, 1)
 
         return panel
+
+    def _restore_default_presets(self):
+        prompt = MessageBox('确认恢复默认预设',
+                            '这会将普通、深夜的通用和专用预设全部恢复为程序内置版本。'
+                            '当前预设会先自动备份。确定继续吗？', self)
+        if prompt.exec() != MessageBox.Accepted:
+            return
+        try:
+            backup = self.preset_manager.restore_bundled_defaults()
+        except Exception as exc:
+            MessageBox('恢复失败', str(exc), self).exec()
+            return
+        self._refresh_presets()
+        self.presets_modified.emit()
+        InfoBar.success('已恢复默认预设', f'原预设备份：{backup}', parent=self)
 
     def _create_right_panel(self) -> QWidget:
         """创建右侧面板（日志+仪表盘）"""
@@ -424,11 +447,12 @@ class PageShop(QWidget):
                 item.widget().deleteLater()
 
         mode = "normal" if self.mode_combo.currentIndex() == 0 else "deepnight"
+        score_enabled = normalize_scoring(self.settings.get("scoring"))["enabled"]
 
         # 通用预设
         general_preset = self.preset_manager.get_general_preset(mode)
         if general_preset:
-            card = PresetCard(general_preset, is_general=True)
+            card = PresetCard(general_preset, is_general=True, score_enabled=score_enabled)
             card.edit_clicked.connect(self._edit_general_preset)
             self.preset_layout.addWidget(card)
 
@@ -442,7 +466,8 @@ class PageShop(QWidget):
                 card = PresetCard(
                     preset, is_general=False,
                     inherited_affixes=general_preset.get("affixes", [])
-                    if general_preset and general_preset.get("is_active", True) else []
+                    if general_preset and general_preset.get("is_active", True) else [],
+                    score_enabled=score_enabled
                 )
                 card.edit_clicked.connect(self._edit_dedicated_preset)
                 card.delete_clicked.connect(self._delete_preset)
@@ -461,7 +486,7 @@ class PageShop(QWidget):
         if mode == "deepnight":
             blacklist = self.preset_manager.get_blacklist_preset()
             if blacklist:
-                card = PresetCard(blacklist, is_general=True)
+                card = PresetCard(blacklist, is_general=True, score_enabled=score_enabled)
                 card.edit_clicked.connect(self._edit_blacklist_preset)
                 self.preset_layout.addWidget(card)
 
@@ -516,13 +541,19 @@ class PageShop(QWidget):
             for_editing=True
         )
 
-        dialog = PresetEditDialog(vocab, preset, is_general=True, parent=self)
-        dialog.preset_saved.connect(lambda pid, name, affixes: self._save_general_preset(mode, affixes))
+        dialog = PresetEditDialog(vocab, preset, is_general=True, parent=self, mode=mode,
+                                  exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
+                                  if mode == "deepnight" else [],
+                                  default_negative_tiers=normalize_scoring(
+                                      self.settings.get("scoring"))["negative_tiers"])
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._save_general_preset(mode, affixes, tiers, negative, official))
         dialog.exec()
 
-    def _save_general_preset(self, mode: str, affixes: list):
+    def _save_general_preset(self, mode: str, affixes: list, tiers=None, negative=None, official=None):
         """保存通用预设"""
-        self.preset_manager.update_general_preset(mode, affixes)
+        self.preset_manager.update_general_preset(mode, affixes, tiers, negative,
+                                                  official_scores=official if mode == 'normal' else None)
         self._refresh_presets()
         self.presets_modified.emit()  # 发出预设修改信号
         InfoBar.success("保存成功", "通用预设已更新", parent=self)
@@ -535,8 +566,8 @@ class PageShop(QWidget):
 
         # 检查数量限制
         dedicated_presets = self.preset_manager.get_dedicated_presets(mode)
-        if len(dedicated_presets) >= 20:
-            MessageBox("错误", "专用预设数量已达上限（20个）", self).exec()
+        if len(dedicated_presets) >= 500:
+            MessageBox("错误", "专用预设数量已达上限（500个）", self).exec()
             return
 
         vocab = self.preset_manager.load_vocabulary(
@@ -548,16 +579,23 @@ class PageShop(QWidget):
         dialog = PresetEditDialog(vocab, None, is_general=False, parent=self, mode=mode,
                                   inherited_vocabulary=general.get("affixes", [])
                                   if general and general.get("is_active", True) else [],
+                                  inherited_tiers=general.get("affix_tiers", {}) if general else {},
+                                  inherited_negative_tiers=general.get("negative_tiers", {}) if general else {},
+                                  default_negative_tiers=normalize_scoring(
+                                      self.settings.get("scoring"))["negative_tiers"],
                                   exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
                                   if mode == "deepnight" else [])
-        dialog.grouped_saved.connect(lambda pid, name, affixes, groups, exceptions: self._save_dedicated_preset(mode, name, affixes, groups, exceptions))
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._save_dedicated_preset(mode, name, affixes, tiers, negative, excluded, official))
         dialog.exec()
 
-    def _save_dedicated_preset(self, mode: str, name: str, affixes: list, groups=None, exceptions=None):
+    def _save_dedicated_preset(self, mode: str, name: str, affixes: list, tiers=None, negative=None, excluded=None, official=None):
         """保存专用预设"""
         self.preset_manager.create_dedicated_preset(mode, name, affixes,
-                                                    blacklist_exceptions=exceptions,
-                                                    required_affix_groups=groups)
+                                                    blacklist_exceptions=[], required_affix_groups=[],
+                                                    affix_tiers=tiers, negative_tiers=negative,
+                                                    excluded_affixes=excluded,
+                                                    official_scores=official if mode == 'normal' else None)
         self._refresh_presets()
         self.presets_modified.emit()  # 发出预设修改信号
         InfoBar.success("创建成功", f"专用预设 \"{name}\" 已创建", parent=self)
@@ -581,18 +619,24 @@ class PageShop(QWidget):
         dialog = PresetEditDialog(vocab, preset, is_general=False, parent=self, mode=mode,
                                   inherited_vocabulary=general.get("affixes", [])
                                   if general and general.get("is_active", True) else [],
+                                  inherited_tiers=general.get("affix_tiers", {}) if general else {},
+                                  inherited_negative_tiers=general.get("negative_tiers", {}) if general else {},
+                                  default_negative_tiers=normalize_scoring(
+                                      self.settings.get("scoring"))["negative_tiers"],
                                   exception_vocabulary=self.preset_manager.load_vocabulary("deepnight_blacklist")
                                   if mode == "deepnight" else [])
-        dialog.grouped_saved.connect(lambda pid, name, affixes, groups, exceptions: self._update_dedicated_preset(mode, pid, name, affixes, groups, exceptions))
+        dialog.graded_saved.connect(lambda pid, name, affixes, tiers, negative, excluded, official:
+                                    self._update_dedicated_preset(mode, pid, name, affixes, tiers, negative, excluded, official))
         dialog.exec()
 
-    def _update_dedicated_preset(self, mode: str, preset_id: str, name: str, affixes: list, groups=None, exceptions=None):
+    def _update_dedicated_preset(self, mode: str, preset_id: str, name: str, affixes: list, tiers=None, negative=None, excluded=None, official=None):
         """更新专用预设"""
         try:
             self.preset_manager.update_dedicated_preset(
                 mode, preset_id, name, affixes,
-                blacklist_exceptions=exceptions,
-                required_affix_groups=groups)
+                blacklist_exceptions=[], required_affix_groups=[], affix_tiers=tiers,
+                negative_tiers=negative, excluded_affixes=excluded,
+                official_scores=official if mode == 'normal' else None)
         except ValueError as e:
             MessageBox("错误", f"保存预设失败: {e}", self).exec()
             return

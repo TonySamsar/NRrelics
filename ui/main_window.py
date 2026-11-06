@@ -67,6 +67,11 @@ class MainWindow(FluentWindow):
             NavigationItemPosition.TOP
         )
 
+        from .pages.page_relics import RelicPage
+        self.relic_page = RelicPage(self.preset_manager)
+        self.addSubInterface(self.relic_page, FluentIcon.TILES, "遗物管理",
+                             NavigationItemPosition.TOP)
+
         # 存档管理
         self.save_page = SavePage()
         self.addSubInterface(
@@ -100,6 +105,8 @@ class MainWindow(FluentWindow):
 
         # 连接设置变更信号 → 商店页面更新设置
         self.settings_page.settings_changed.connect(self.shop_page.update_settings)
+        self.settings_page.settings_changed.connect(
+            lambda settings: self.repo_page._refresh_presets())
 
         # 连接预设变更信号：当任一页面修改预设时，通知另一页面刷新
         self.shop_page.presets_modified.connect(self._on_presets_changed)
